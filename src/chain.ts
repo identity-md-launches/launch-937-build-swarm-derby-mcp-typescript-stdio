@@ -68,7 +68,7 @@ export interface DerbyChain {
 }
 
 // ABI taken from SwarmDerby.sol (pepegobig/swarm-derby-contracts @ 589f934).
-const DERBY_ABI = [
+export const DERBY_ABI = [
   "function imd() view returns (address)",
   "function packPrice() view returns (uint256)",
   "function currentDay() view returns (uint256)",
@@ -85,7 +85,7 @@ const DERBY_ABI = [
   "event SwingCommitted(uint256 indexed swingId, address indexed player, uint8 league, uint8 quality, uint8 velo, uint64 targetBlock)",
   "event SwingResolved(uint256 indexed swingId, address indexed player, uint8 tier, uint16 feet)",
   "event DaySettled(uint8 indexed league, uint256 indexed day, address[] winners, uint256[] amounts, address settler, uint256 tip, uint256 rollover)",
-  "event TurnsBought(address indexed player, uint8 league, uint256 count, uint256 cost, uint256 burned)",
+  "event TurnsBought(address indexed player, uint8 indexed league, uint256 count, uint256 cost, uint256 burned)",
   "error NotOwner()",
   "error BadLeague()",
   "error BadPrice()",
@@ -214,6 +214,12 @@ export function createChain(opts: ChainOptions): DerbyChain {
     try {
       rc = await tx.wait(1, opts.txTimeoutMs ?? 60000);
     } catch (err) {
+      const source = err as { code?: string; receipt?: { status?: number } };
+      if (source.code === "CALL_EXCEPTION" && source.receipt?.status === 0) {
+        const e = new Error(`Transaction ${tx.hash} reverted.`);
+        (e as Error & { confirmedNoCharge?: boolean }).confirmedNoCharge = true;
+        throw e;
+      }
       const e = new Error(`${explainError(err)} (transaction ${tx.hash} was broadcast but not confirmed).`);
       (e as Error & { transactionHash?: string }).transactionHash = tx.hash;
       throw e;

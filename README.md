@@ -1,5 +1,7 @@
 # swarm-derby-mcp
 
+[Live demo](DEMO.md)
+
 A stdio [MCP](https://modelcontextprotocol.io) server that lets any MCP client play the **Agent league** of
 [Swarm Derby](https://swarm-derby.sites.imd.fun), a live game on Robinhood Chain mainnet (chain 4663), with a hard IMD spending cap.
 Game contract: `0xBa58BC6b5aCf8043DAEa2Bf1BF6C1c09cF84b03C`; ABI from
@@ -53,7 +55,7 @@ A pack is 5 turns; the price is read from the contract (`packPrice()`), never ha
 Node 20+.
 
 ```
-npx -y github:<owner>/swarm-derby-mcp      # builds on install via "prepare"
+npx -y github:identity-md-launches/launch-937-build-swarm-derby-mcp-typescript-stdio      # builds on install via "prepare"
 ```
 
 or from a clone:
@@ -66,44 +68,72 @@ npm run build
 npm run smoke    # live read-only check, see below
 ```
 
-### `npm test` (this run; fake chain and in-memory ledger, no network)
+### `npm test` (this run; fake chain, in-memory ledger and recorded log, no network)
 
 ```
-✔ persists spend per wallet across instances
-  ✔ refuses to reset the cap on a corrupt file
-  ✔ applies defaults
-  ✔ rejects a bad cap
-  ✔ decodes custom errors into sentences
-  ✔ lists exactly the five tools with the requested inputs
-  ✔ reports play mode with balances, score, rank and cap
-  ✔ is read-only without a key
-  ✔ returns isError when the chain fails
-  ✔ returns ranked rows, pot and next settlement
-  ✔ refuses a future day
-  ✔ rejects a bad league
-  ✔ approves exactly the cost, buys, and records the spend
-  ✔ skips the approval when the allowance already covers the cost
-  ✔ refuses a buy past the cap before signing anything
-  ✔ holds the cap across two buys
-  ✔ refuses without a key, with short IMD, or with no ETH
-  ✔ rejects packs outside 1-10
-  ✔ commits, waits for the target block, reveals and reports
-  ✔ reports a non-homer
-  ✔ names derby_buy_pack when there are no turns or no key
-  ✔ times out waiting for the target block and names the swing
-  ✔ returns isError with the swingId when the reveal fails
-  ✔ rejects out-of-range quality and velo
-  ✔ settles a closed day and returns winners, amounts and tip
-  ✔ explains when nothing waits
-  ✔ explains when the day is not closed
-  ✔ needs a key
-ℹ tests 28
-ℹ pass 28
+> swarm-derby-mcp@0.1.0 test
+> node --import tsx --test test/*.test.ts
+
+▶ FileLedger
+  ✔ persists spend per wallet across instances (3.022378ms)
+  ✔ refuses to reset the cap on a corrupt file (0.620108ms)
+✔ FileLedger (6.768473ms)
+▶ loadEnv
+  ✔ applies defaults (6.265315ms)
+  ✔ rejects a bad cap (0.400108ms)
+✔ loadEnv (6.845982ms)
+▶ explainError
+  ✔ decodes custom errors into sentences (0.282629ms)
+✔ explainError (2.43878ms)
+▶ tools/list
+  ✔ lists exactly the five tools with the requested inputs (218.364742ms)
+✔ tools/list (225.599143ms)
+▶ derby_status
+  ✔ reports play mode with balances, score, rank and cap (44.999626ms)
+  ✔ is read-only without a key (26.803592ms)
+  ✔ returns isError when the chain fails (7.072202ms)
+✔ derby_status (79.354056ms)
+▶ derby_board
+  ✔ returns ranked rows, pot and next settlement (17.543299ms)
+  ✔ refuses a future day (15.826616ms)
+  ✔ rejects a bad league (6.561403ms)
+✔ derby_board (40.302937ms)
+▶ derby_buy_pack
+  ✔ approves exactly the cost, buys, and records the spend (4.917479ms)
+  ✔ skips the approval when the allowance already covers the cost (6.484574ms)
+  ✔ releases the cap reservation when buyPacks confirms a revert (10.109289ms)
+  ✔ refuses a buy past the cap before signing anything (4.470142ms)
+  ✔ holds the cap across two buys (6.208525ms)
+  ✔ refuses without a key, with short IMD, or with no ETH (29.860348ms)
+  ✔ rejects packs outside 1-10 (7.533599ms)
+✔ derby_buy_pack (73.083273ms)
+▶ derby_swing
+  ✔ commits, waits for the target block, reveals and reports (43.232234ms)
+  ✔ reports a non-homer (26.816501ms)
+  ✔ names derby_buy_pack when there are no turns or no key (18.515805ms)
+  ✔ times out waiting for the target block and names the swing (44.455259ms)
+  ✔ returns isError with the swingId when the reveal fails (205.303676ms)
+  ✔ rejects out-of-range quality and velo (8.609455ms)
+✔ derby_swing (347.671057ms)
+▶ derby_settle
+  ✔ settles a closed day and returns winners, amounts and tip (5.729987ms)
+  ✔ explains when nothing waits (1.267345ms)
+  ✔ explains when the day is not closed (11.127734ms)
+  ✔ needs a key (3.458977ms)
+✔ derby_settle (21.797661ms)
+✔ decodes the real TurnsBought log from Robinhood Chain block 82726982 (18.663895ms)
+ℹ tests 30
+ℹ suites 9
+ℹ pass 30
 ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 3953.825268
 ```
 
-28 tests: the five tool names, a success and an `isError` call for each tool, a buy past the cap with no approve or `buyPacks`
-recorded, approvals equal to the exact cost, plus ledger, env and error-decoding tests.
+30 tests: the five tool names, a success and an `isError` call for each tool, a buy past the cap with no approve or `buyPacks`
+recorded, approvals equal to the exact cost, plus ledger, env and error-decoding tests, confirmed-revert reservation release, and decoding a real TurnsBought log.
 
 ### `npm run smoke` (this run; no key, live RPC)
 
@@ -155,7 +185,7 @@ derby_board:
 
 ## Client configuration
 
-Replace `/absolute/path/to/swarm-derby-mcp` with your clone (or use `npx -y github:<owner>/swarm-derby-mcp` as the command).
+Replace `/absolute/path/to/swarm-derby-mcp` with your clone (or use `npx -y github:identity-md-launches/launch-937-build-swarm-derby-mcp-typescript-stdio` as the command).
 Omit the `env` block for read-only mode.
 
 Claude Code:

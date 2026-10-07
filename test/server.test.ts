@@ -174,6 +174,26 @@ describe("derby_buy_pack", () => {
     assert.deepEqual(chain.calls, ["buyPacks"]);
   });
 
+  it("releases the cap reservation when buyPacks confirms a revert", async () => {
+    const chain = new FakeChain();
+    const buy = chain.buyPacks.bind(chain);
+    const ledger = new MemoryLedger();
+    chain.buyPacks = async () => {
+      assert.equal(ledger.spent(WALLET), PRICE);
+      throw Object.assign(new Error("Transaction 0xbuy reverted."), { confirmedNoCharge: true });
+    };
+    const { call } = await connect(chain, ledger, { ...CONFIG, maxImdWei: PRICE });
+    const r: any = await call("derby_buy_pack", { packs: 1 });
+    assert.equal(r.isError, true);
+    assert.match(text(r), /reverted/);
+    assert.equal(ledger.spent(WALLET), 0n);
+    assert.equal(chain.imd, E("10"));
+    assert.equal(chain.turnCount, 0n);
+    chain.buyPacks = buy;
+    assert.equal(((await call("derby_buy_pack", { packs: 1 })) as any).isError, undefined);
+    assert.equal(ledger.spent(WALLET), PRICE);
+  });
+
   it("refuses a buy past the cap before signing anything", async () => {
     const { call, chain, ledger } = await connect(new FakeChain(), new MemoryLedger({ [WALLET]: E("1.5") }));
     const r: any = await call("derby_buy_pack", { packs: 2 });
