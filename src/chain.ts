@@ -1,4 +1,4 @@
-import { AbiCoder, Contract, JsonRpcProvider, Wallet, keccak256, hexlify, randomBytes } from "ethers";
+import { AbiCoder, Contract, JsonRpcProvider, Network, Wallet, keccak256, hexlify, randomBytes } from "ethers";
 
 export const LEAGUES = { arcade: 0, agent: 1 } as const;
 export type League = keyof typeof LEAGUES;
@@ -31,6 +31,11 @@ export interface Resolved {
   feet: number;
 }
 
+export interface BuyReceipt {
+  txHash: string;
+  costWei: bigint;
+}
+
 /** A committed swing. The salt lives only inside `reveal`'s closure. */
 export interface PendingSwing {
   swingId: bigint;
@@ -55,9 +60,11 @@ export interface DerbyChain {
   nextSettlement(league: League): Promise<Settlement>;
   blockNumber(): Promise<number>;
   approve(amount: bigint): Promise<string>;
-  buyPacks(league: League, packs: number): Promise<string>;
+  buyPacks(league: League, packs: number): Promise<string | BuyReceipt>;
   commitSwing(league: League, quality: number, velo: number): Promise<PendingSwing>;
   settleNextDay(league: League): Promise<Settled>;
+  /** Set by the real client after buyPacks confirms; fakes may provide it too. */
+  readonly lastBuyCost?: bigint;
 }
 
 // ABI taken from SwarmDerby.sol (pepegobig/swarm-derby-contracts @ 589f934).
@@ -78,6 +85,7 @@ const DERBY_ABI = [
   "event SwingCommitted(uint256 indexed swingId, address indexed player, uint8 league, uint8 quality, uint8 velo, uint64 targetBlock)",
   "event SwingResolved(uint256 indexed swingId, address indexed player, uint8 tier, uint16 feet)",
   "event DaySettled(uint8 indexed league, uint256 indexed day, address[] winners, uint256[] amounts, address settler, uint256 tip, uint256 rollover)",
+  "event TurnsBought(address indexed player, uint8 league, uint256 count, uint256 cost, uint256 burned)",
   "error NotOwner()",
   "error BadLeague()",
   "error BadPrice()",
@@ -162,11 +170,12 @@ export interface ChainOptions {
   rpcUrl: string;
   contract: string;
   privateKey?: string;
+  txTimeoutMs?: number;
 }
 
 export function createChain(opts: ChainOptions): DerbyChain {
   // No read cache: on ~100ms blocks the default cache can return a stale nonce after a tx.
-  const provider = new JsonRpcProvider(opts.rpcUrl, undefined, { cacheTimeout: -1 });
+  const provider = new JsonRpcProvider(opts.rpcUrl, Network.from(4663), { cacheTimeout: -1, staticNetwork: true });
   provider.pollingInterval = 200;
   let signer: Wallet | undefined;
   if (opts.privateKey) {
@@ -189,13 +198,31 @@ export function createChain(opts: ChainOptions): DerbyChain {
     try {
       return await p();
     } catch (err) {
-      throw new Error(explainError(err, derby.interface));
+      const e = new Error(explainError(err, derby.interface)) as Error & {
+        confirmedNoCharge?: boolean;
+        transactionHash?: string;
+      };
+      const source = err as { confirmedNoCharge?: boolean; transactionHash?: string };
+      e.confirmedNoCharge = source.confirmedNoCharge;
+      e.transactionHash = source.transactionHash;
+      throw e;
     }
   };
   const send = async (txPromise: Promise<any>) => {
     const tx = await txPromise;
-    const rc = await tx.wait();
-    if (!rc || rc.status !== 1) throw new Error(`Transaction ${tx.hash} reverted.`);
+    let rc: any;
+    try {
+      rc = await tx.wait(1, opts.txTimeoutMs ?? 60000);
+    } catch (err) {
+      const e = new Error(`${explainError(err)} (transaction ${tx.hash} was broadcast but not confirmed).`);
+      (e as Error & { transactionHash?: string }).transactionHash = tx.hash;
+      throw e;
+    }
+    if (!rc || rc.status !== 1) {
+      const e = new Error(`Transaction ${tx.hash} reverted.`);
+      (e as Error & { confirmedNoCharge?: boolean }).confirmedNoCharge = true;
+      throw e;
+    }
     return rc;
   };
   const event = (rc: any, name: string) => {
@@ -210,8 +237,10 @@ export function createChain(opts: ChainOptions): DerbyChain {
     throw new Error(`Transaction ${rc.hash} did not emit ${name}.`);
   };
 
+  let lastBuyCost: bigint | undefined;
   return {
     wallet: signer?.address,
+    get lastBuyCost() { return lastBuyCost; },
     currentDay: () => wrap(async () => BigInt(await derby.currentDay())),
     packPrice: () => wrap(async () => BigInt(await derby.packPrice())),
     imdBalance: (a) => wrap(async () => BigInt(await (await imd()).balanceOf(a))),
@@ -239,8 +268,11 @@ export function createChain(opts: ChainOptions): DerbyChain {
     buyPacks: (l, packs) =>
       wrap(async () => {
         need();
+        lastBuyCost = undefined;
         const rc = await send(derby.buyPacks(LEAGUES[l], packs));
-        return rc.hash as string;
+        const bought = event(rc, "TurnsBought");
+        lastBuyCost = BigInt(bought.args.cost);
+        return { txHash: rc.hash as string, costWei: lastBuyCost! };
       }),
     commitSwing: (l, quality, velo) =>
       wrap(async () => {

@@ -39,10 +39,12 @@ A pack is 5 turns; the price is read from the contract (`packPrice()`), never ha
 - `derby_buy_pack` computes `cost = packs x packPrice()` and refuses unless `spent + cost <= DERBY_MAX_IMD`, the wallet holds
   enough IMD, and it has ETH for gas. All refusals happen before any signature, so nothing is approved or bought.
 - When the allowance is short it approves **only the exact cost**, then calls `buyPacks(1, packs)`.
-- The ledger stores spent wei per wallet address (`{"spent": {"0xwallet": "wei"}}`, file mode 0600) and is rewritten atomically right
-  after each buy, so the cap holds across restarts. Deleting the ledger resets the cap: it is a guard against runaway agents, not
-  against the key's owner. A corrupt ledger makes buys fail rather than silently resetting.
-- Write tools run one at a time, so concurrent calls cannot both pass the cap check.
+- The ledger stores reserved/spent wei per wallet address (`{"spent": {"0xwallet": "wei"}}`, file mode 0600). A buy reserves its
+  cost before broadcasting, so a mined-but-unconfirmed RPC failure or process restart cannot silently reset the cap. An unknown
+  confirmation remains counted; only a receipt that proves a revert releases the reservation. File-ledger instances also take an
+  exclusive lock around the cap check, reservation, approval and buy, so multiple MCP processes sharing a ledger cannot both pass.
+  On confirmation, the `TurnsBought` event's actual cost replaces the preflight estimate. Deleting the ledger resets the cap: it is
+  a guard against runaway agents, not against the key's owner. A corrupt ledger makes buys fail rather than silently resetting.
 - Swing salts are generated per swing, kept only in memory and never logged or returned. Logs go to stderr.
 - Only IMD spent on packs counts toward the cap; gas (ETH) does not. `derby_settle` costs gas only and may earn a small tip.
 
@@ -204,8 +206,9 @@ If `node` is not found by Claude Desktop, use its absolute path (`which node`).
 ## Choices and limits
 
 - `todayRank` and board rows come from the contract's top-10 board; a player outside it has rank `null`.
-- If `derby_swing` times out waiting for the target block, the swing stays committed; the salt is in memory only, so it is not
-  retried and counts as a foul if left unrevealed past 255 blocks.
+- If `derby_swing` times out waiting for the target block, the swing stays committed; the salt is in memory only, so it cannot be
+  recovered after a process restart and counts as a foul if left unrevealed past 255 blocks. Transient reveal errors are retried
+  with the same in-memory salt until `DERBY_REVEAL_TIMEOUT_MS`; a broadcast transaction wait is bounded by that same timeout.
 - The wallet is the playing account; the contract's session-key feature is not used.
 - Layout: `src/chain.ts` (ethers client, ABI, error decoding), `src/ledger.ts`, `src/config.ts` (env), `src/server.ts`
   (`createServer({chain, ledger, config})`), `src/index.ts` (stdio entry), `scripts/smoke.mjs`, `test/`.

@@ -197,8 +197,8 @@ export function createServer({ chain, ledger, config }: Deps): McpServer {
       },
       annotations: { destructiveHint: true, openWorldHint: true },
     },
-    ({ packs }) =>
-      exclusive(async () => {
+    ({ packs }) => {
+      const run = async () => {
         try {
           const wallet = chain.wallet;
           if (!wallet) return noKey("derby_buy_pack");
@@ -217,21 +217,41 @@ export function createServer({ chain, ledger, config }: Deps): McpServer {
             return fail(`Refused: the wallet ${wallet} has no ETH for gas. Nothing was signed.`);
           }
           const txHashes: string[] = [];
-          if ((await chain.allowance(wallet)) < cost) txHashes.push(await chain.approve(cost));
-          txHashes.push(await chain.buyPacks("agent", packs));
-          ledger.add(wallet, cost); // written straight after the buy so the cap survives restarts
-          return ok({
-            txHashes,
-            packs,
-            costImd: imd(cost),
-            turnsAdded: packs * 5,
-            agentTurns: Number(await chain.turns("agent", wallet)),
-            cap: cap(wallet),
-          });
+          const reserved = ledger.reserve
+            ? ledger.reserve(wallet, cost, config.maxImdWei)
+            : (() => { if (spent + cost > config.maxImdWei) return false; ledger.add(wallet, cost); return true; })();
+          if (!reserved) {
+            return fail(`Refused: buying ${packs} pack(s) would pass the DERBY_MAX_IMD cap of ${imd(config.maxImdWei)} IMD. Nothing was signed.`);
+          }
+          try {
+            if ((await chain.allowance(wallet)) < cost) txHashes.push(await chain.approve(cost));
+            const bought = await chain.buyPacks("agent", packs);
+            const buyHash = typeof bought === "string" ? bought : bought.txHash;
+            txHashes.push(buyHash);
+            const receiptCost = typeof bought === "string" ? undefined : bought.costWei;
+            const actualCost = receiptCost ?? chain.lastBuyCost ?? cost;
+            if (actualCost !== cost && ledger.adjust) ledger.adjust(wallet, actualCost - cost);
+            return ok({
+              txHashes,
+              packs,
+              costImd: imd(actualCost),
+              turnsAdded: packs * 5,
+              agentTurns: Number(await chain.turns("agent", wallet)),
+              cap: cap(wallet),
+            });
+          } catch (err) {
+            const e = err as Error & { confirmedNoCharge?: boolean };
+            // An unknown confirmation remains reserved: the transfer may have happened.
+            if (e.confirmedNoCharge && ledger.adjust) ledger.adjust(wallet, -cost);
+            else if (e.confirmedNoCharge) ledger.add(wallet, -cost);
+            throw err;
+          }
         } catch (err) {
           return fail(message(err));
         }
-      }),
+      };
+      return exclusive(() => ledger.withSpendLock ? ledger.withSpendLock(run) : run());
+    },
   );
 
   server.registerTool(
@@ -279,11 +299,20 @@ export function createServer({ chain, ledger, config }: Deps): McpServer {
             await sleep(config.pollIntervalMs);
           }
           let resolved;
-          try {
-            resolved = await pending.reveal();
-          } catch (err) {
-            return fail(`Swing ${id} was committed (tx ${pending.commitTxHash}) but the reveal failed: ${message(err)}`);
+          let revealError: unknown;
+          for (;;) {
+            try {
+              resolved = await pending.reveal();
+              break;
+            } catch (err) {
+              revealError = err;
+              if (Date.now() >= deadline) {
+                return fail(`Swing ${id} was committed (tx ${pending.commitTxHash}) but the reveal failed: ${message(err)}`);
+              }
+              await sleep(config.pollIntervalMs);
+            }
           }
+          if (!resolved) return fail(`Swing ${id} was committed but the reveal failed: ${message(revealError)}`);
           const today = await agentScore(wallet, await chain.currentDay());
           return ok({
             swingId: id,

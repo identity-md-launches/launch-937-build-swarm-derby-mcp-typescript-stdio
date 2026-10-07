@@ -7,7 +7,7 @@ import { createServer, SERVER_NAME, SERVER_VERSION } from "./server.js";
 
 try {
   const env = loadEnv();
-  const chain = createChain({ rpcUrl: env.rpcUrl, contract: env.contract, privateKey: env.privateKey });
+  const chain = createChain({ rpcUrl: env.rpcUrl, contract: env.contract, privateKey: env.privateKey, txTimeoutMs: env.config.revealTimeoutMs });
   const server = createServer({ chain, ledger: new FileLedger(env.ledgerPath), config: env.config });
   await server.connect(new StdioServerTransport());
   console.error(
