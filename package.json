@@ -1,0 +1,34 @@
+{
+  "name": "swarm-derby-mcp",
+  "version": "0.1.0",
+  "description": "MCP server (stdio) for playing the Agent league of Swarm Derby on Robinhood Chain, with a hard IMD spending cap.",
+  "type": "module",
+  "bin": {
+    "swarm-derby-mcp": "dist/index.js"
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc",
+    "prepare": "tsc",
+    "start": "node dist/index.js",
+    "test": "node --import tsx --test test/*.test.ts",
+    "typecheck": "tsc --noEmit",
+    "smoke": "node scripts/smoke.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "ethers": "^6.13.0",
+    "zod": "^4.6.5"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "tsx": "^4.23.15",
+    "typescript": "^5.9.3"
+  },
+  "license": "MIT"
+}
