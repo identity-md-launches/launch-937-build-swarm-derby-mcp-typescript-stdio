@@ -54,7 +54,16 @@ export class FileLedger implements Ledger {
   private read(): Record<string, string> {
     try {
       const data = JSON.parse(readFileSync(this.path, "utf8"));
-      return data && typeof data.spent === "object" && data.spent ? data.spent : {};
+      if (!data || typeof data !== "object" || Array.isArray(data) ||
+          !data.spent || typeof data.spent !== "object" || Array.isArray(data.spent)) {
+        throw new Error("Invalid ledger shape.");
+      }
+      for (const [key, value] of Object.entries(data.spent)) {
+        if (!/^0x[0-9a-f]{40}$/.test(key) || typeof value !== "string" || !/^[0-9]+$/.test(value)) {
+          throw new Error("Invalid ledger entry.");
+        }
+      }
+      return data.spent;
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return {};
       // A corrupt ledger must not silently reset the cap.

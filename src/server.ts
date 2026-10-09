@@ -1,7 +1,7 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { formatEther } from "ethers";
 import { z } from "zod";
-import { TIERS, type DerbyChain, type League } from "./chain.js";
+import { TIERS, type DerbyChain, type League, type PendingSwing } from "./chain.js";
 import type { Config } from "./config.js";
 import type { Ledger } from "./ledger.js";
 
@@ -42,6 +42,8 @@ export function createServer({ chain, ledger, config }: Deps): McpServer {
     queue = run.catch(() => undefined);
     return run;
   };
+
+  const pendingSwings = new Map<bigint, PendingSwing>();
 
   const cap = (wallet: string | undefined) => {
     const spent = wallet ? ledger.spent(wallet) : 0n;
@@ -188,7 +190,7 @@ export function createServer({ chain, ledger, config }: Deps): McpServer {
         packs: z.number().int().min(1).max(10).describe("Number of 5-turn packs to buy, 1-10."),
       },
       outputSchema: {
-        txHashes: z.array(z.string()).describe("Approve (if needed) then buy."),
+        txHashes: z.array(z.string()).describe("Approve then buy."),
         packs: z.number(),
         costImd: z.string(),
         turnsAdded: z.number(),
@@ -223,14 +225,24 @@ export function createServer({ chain, ledger, config }: Deps): McpServer {
           if (!reserved) {
             return fail(`Refused: buying ${packs} pack(s) would pass the DERBY_MAX_IMD cap of ${imd(config.maxImdWei)} IMD. Nothing was signed.`);
           }
+          let beforeBuy: { turns: bigint; balance: bigint } | undefined;
           try {
-            if ((await chain.allowance(wallet)) < cost) txHashes.push(await chain.approve(cost));
+            txHashes.push(await chain.approve(cost));
+            // Snapshot immediately before the buy, then independently check any reported revert.
+            const before = await Promise.all([chain.turns("agent", wallet), chain.imdBalance(wallet)]);
+            beforeBuy = { turns: before[0], balance: before[1] };
             const bought = await chain.buyPacks("agent", packs);
             const buyHash = typeof bought === "string" ? bought : bought.txHash;
             txHashes.push(buyHash);
             const receiptCost = typeof bought === "string" ? undefined : bought.costWei;
             const actualCost = receiptCost ?? chain.lastBuyCost ?? cost;
-            if (actualCost !== cost && ledger.adjust) ledger.adjust(wallet, actualCost - cost);
+            if (actualCost !== cost) {
+              if (ledger.adjust) ledger.adjust(wallet, actualCost - cost);
+              else ledger.add(wallet, actualCost - cost);
+            }
+            if (actualCost > cost) {
+              return fail(`The buy cost ${imd(actualCost)} IMD was above the quoted price of ${imd(cost)} IMD (tx ${buyHash}). The charged amount was kept in the spending ledger.`);
+            }
             return ok({
               txHashes,
               packs,
@@ -240,10 +252,17 @@ export function createServer({ chain, ledger, config }: Deps): McpServer {
               cap: cap(wallet),
             });
           } catch (err) {
-            const e = err as Error & { confirmedNoCharge?: boolean };
-            // An unknown confirmation remains reserved: the transfer may have happened.
-            if (e.confirmedNoCharge && ledger.adjust) ledger.adjust(wallet, -cost);
-            else if (e.confirmedNoCharge) ledger.add(wallet, -cost);
+            const e = err as Error & { reportedRevert?: boolean; confirmedNoCharge?: boolean };
+            // A receipt or RPC assertion alone cannot prove that nothing was spent.
+            if ((e.reportedRevert || e.confirmedNoCharge) && beforeBuy) {
+              try {
+                const [turns, balance] = await Promise.all([chain.turns("agent", wallet), chain.imdBalance(wallet)]);
+                if (turns <= beforeBuy.turns && balance >= beforeBuy.balance) {
+                  if (ledger.adjust) ledger.adjust(wallet, -cost);
+                  else ledger.add(wallet, -cost);
+                }
+              } catch { /* failed verification keeps the reservation */ }
+            }
             throw err;
           }
         } catch (err) {
@@ -259,12 +278,14 @@ export function createServer({ chain, ledger, config }: Deps): McpServer {
     {
       title: "Take a swing",
       description:
-        "Spend one agent-league turn: commit a swing, wait for the target block, then reveal it. Tiers: WHIFF, FOUL, POP, HOMER, BOMB, SLAM; HOMER and above score feet. Needs a key and a turn (buy with derby_buy_pack).",
+        "Spend one agent-league turn: commit a swing, wait for the house draw, then reveal it. A timed-out commit is kept: the next call reveals it if drawn or refunds it after 5 minutes; revealing after 10 minutes counts as a foul. Tiers: WHIFF, FOUL, POP, HOMER, BOMB, SLAM; HOMER and above score feet. Needs a key and a turn (buy with derby_buy_pack).",
       inputSchema: {
         quality: z.number().int().min(1).max(100).optional().default(100).describe("Swing quality 1-100; higher is never worse. Default 100."),
         velo: z.number().int().min(0).max(100).optional().default(100).describe("Exit-velo score 0-100; low values rule out bombs and slams. Default 100."),
       },
       outputSchema: {
+        earlier: z.array(z.union([z.string(), z.record(z.string(), z.unknown())])).optional(),
+        note: z.string().optional(),
         swingId: z.string(),
         tier: z.number(),
         tierName: z.enum(TIERS),
@@ -278,54 +299,74 @@ export function createServer({ chain, ledger, config }: Deps): McpServer {
     },
     ({ quality, velo }) =>
       exclusive(async () => {
+        const earlier: (string | Record<string, unknown>)[] = [];
+        const swingFail = (text: string): Result => earlier.length
+          ? { ...fail(`${text} Earlier: ${JSON.stringify(earlier)}`), structuredContent: { earlier } }
+          : fail(text);
         try {
           const wallet = chain.wallet;
           if (!wallet) return noKey("derby_swing");
+          const reveal = async (pending: PendingSwing) => {
+            const late = (await chain.blockTimestamp()) > pending.committedAt + 600;
+            const resolved = await pending.reveal();
+            pendingSwings.delete(pending.swingId);
+            const today = await agentScore(wallet, await chain.currentDay());
+            return {
+              swingId: pending.swingId.toString(),
+              tier: resolved.tier,
+              tierName: TIERS[resolved.tier] ?? "WHIFF",
+              feet: resolved.feet,
+              homer: resolved.tier >= 3,
+              todayScore: today.score,
+              turnsLeft: Number(await chain.turns("agent", wallet)),
+              txHashes: { commit: pending.commitTxHash, finalize: resolved.txHash },
+              ...(late ? { note: `Swing ${pending.swingId} was revealed after 10 minutes and counted as a foul.` } : {}),
+            };
+          };
+          for (const pending of pendingSwings.values()) {
+            const status = await pending.status();
+            if (status === 2) earlier.push(await reveal(pending));
+            else if (status === 1 && (await chain.blockTimestamp()) > pending.committedAt + 300) {
+              const hash = await pending.expire();
+              pendingSwings.delete(pending.swingId);
+              earlier.push(`The house did not draw swing ${pending.swingId} within 5 minutes. The turn was given back (tx ${hash}).`);
+            } else if (status === 3 || status === 4) pendingSwings.delete(pending.swingId);
+          }
           if ((await chain.turns("agent", wallet)) === 0n) {
-            return fail("No agent turns left. Call derby_buy_pack to buy a pack of 5 turns first.");
+            const recovered = [...earlier].reverse().find((item) => typeof item !== "string");
+            if (recovered) return ok({ ...recovered as Record<string, unknown>, earlier });
+            return swingFail("No agent turns left. Call derby_buy_pack to buy a pack of 5 turns first.");
           }
           if ((await chain.ethBalance(wallet)) === 0n) {
-            return fail(`The wallet ${wallet} has no ETH for gas, so it cannot swing.`);
+            return swingFail(`The wallet ${wallet} has no ETH for gas, so it cannot swing.`);
           }
           const pending = await chain.commitSwing("agent", quality, velo);
-          const id = pending.swingId.toString();
-          const deadline = Date.now() + config.revealTimeoutMs;
-          while ((await chain.blockNumber()) <= pending.targetBlock) {
-            if (Date.now() >= deadline) {
-              return fail(
-                `Swing ${id} was committed (tx ${pending.commitTxHash}) but block ${pending.targetBlock} was not reached within ${config.revealTimeoutMs} ms, so it was not revealed. It counts as a foul if still unrevealed 255 blocks after the target.`,
-              );
-            }
-            await sleep(config.pollIntervalMs);
-          }
-          let resolved;
-          let revealError: unknown;
+          pendingSwings.set(pending.swingId, pending);
+          const deadline = Date.now() + config.drawTimeoutMs;
           for (;;) {
-            try {
-              resolved = await pending.reveal();
-              break;
-            } catch (err) {
-              revealError = err;
-              if (Date.now() >= deadline) {
-                return fail(`Swing ${id} was committed (tx ${pending.commitTxHash}) but the reveal failed: ${message(err)}`);
+            const status = await pending.status();
+            if (status === 2) {
+              try {
+                return ok({ ...await reveal(pending), ...(earlier.length ? { earlier } : {}) });
+              } catch (err) {
+                if (Date.now() >= deadline || (err as { transactionHash?: string }).transactionHash) {
+                  return swingFail(`Swing ${pending.swingId} is committed but the reveal failed: ${message(err)}`);
+                }
+                await sleep(Math.max(config.pollIntervalMs, chain.pollIntervalMs ?? 0));
+                continue;
               }
-              await sleep(config.pollIntervalMs);
             }
+            if (status === 3 || status === 4) {
+              pendingSwings.delete(pending.swingId);
+              return swingFail(`Swing ${pending.swingId} was already finalized or refunded.`);
+            }
+            if (Date.now() >= deadline) {
+              return swingFail(`Swing ${pending.swingId} is committed but not drawn yet. The next derby_swing call reveals it if the house draws it, or gives the turn back 5 minutes after the commit.`);
+            }
+            await sleep(Math.max(config.pollIntervalMs, chain.pollIntervalMs ?? 0));
           }
-          if (!resolved) return fail(`Swing ${id} was committed but the reveal failed: ${message(revealError)}`);
-          const today = await agentScore(wallet, await chain.currentDay());
-          return ok({
-            swingId: id,
-            tier: resolved.tier,
-            tierName: TIERS[resolved.tier] ?? "WHIFF",
-            feet: resolved.feet,
-            homer: resolved.tier >= 3,
-            todayScore: today.score,
-            turnsLeft: Number(await chain.turns("agent", wallet)),
-            txHashes: { commit: pending.commitTxHash, finalize: resolved.txHash },
-          });
         } catch (err) {
-          return fail(message(err));
+          return swingFail(message(err));
         }
       }),
   );
@@ -357,7 +398,7 @@ export function createServer({ chain, ledger, config }: Deps): McpServer {
           if (!next.exists) return fail(`Nothing to settle: every ${league} day with activity is already settled.`);
           if (!next.ready) {
             return fail(
-              `Day ${next.day} of the ${league} league is not closed yet: a day closes once it is over (UTC) and every swing of it has been revealed or its 255-block window has passed.`,
+              `Day ${next.day} of the ${league} league is not closed yet: a day closes once it is over (UTC) and every swing of it has been revealed or its 10-minute draw and reveal window has passed.`,
             );
           }
           if ((await chain.ethBalance(wallet)) === 0n) {

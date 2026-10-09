@@ -1,4 +1,4 @@
-import { AbiCoder, Contract, JsonRpcProvider, Network, Wallet, keccak256, hexlify, randomBytes } from "ethers";
+import { AbiCoder, Contract, JsonRpcProvider, Network, Wallet, Interface, keccak256, hexlify, randomBytes } from "ethers";
 
 export const LEAGUES = { arcade: 0, agent: 1 } as const;
 export type League = keyof typeof LEAGUES;
@@ -39,7 +39,9 @@ export interface BuyReceipt {
 /** A committed swing. The salt lives only inside `reveal`'s closure. */
 export interface PendingSwing {
   swingId: bigint;
-  targetBlock: number;
+  committedAt: number;
+  status(): Promise<number>;
+  expire(): Promise<string>;
   commitTxHash: string;
   reveal(): Promise<Resolved>;
 }
@@ -59,6 +61,9 @@ export interface DerbyChain {
   dayPot(league: League, day: bigint): Promise<bigint>;
   nextSettlement(league: League): Promise<Settlement>;
   blockNumber(): Promise<number>;
+  blockTimestamp(): Promise<number>;
+  /** Minimum status-poll interval for a real RPC. */
+  readonly pollIntervalMs?: number;
   approve(amount: bigint): Promise<string>;
   buyPacks(league: League, packs: number): Promise<string | BuyReceipt>;
   commitSwing(league: League, quality: number, velo: number): Promise<PendingSwing>;
@@ -67,7 +72,7 @@ export interface DerbyChain {
   readonly lastBuyCost?: bigint;
 }
 
-// ABI taken from SwarmDerby.sol (pepegobig/swarm-derby-contracts @ 589f934).
+// ABI taken from SwarmDerby.sol (pepegobig/swarm-derby-contracts @ da1a8647d6f33b23e6838b57fc7821ef7a6b454b).
 export const DERBY_ABI = [
   "function imd() view returns (address)",
   "function packPrice() view returns (uint256)",
@@ -81,8 +86,12 @@ export const DERBY_ABI = [
   "function buyPacks(uint8 league, uint256 packs)",
   "function swing(uint8 league, uint8 quality, uint8 velo, bytes32 commit) returns (uint256)",
   "function finalize(uint256 swingId, bytes32 salt) returns (uint8 tier, uint16 feet)",
+  "function expire(uint256 swingId)",
+  "function swings(uint256) view returns (address player, uint8 league, uint8 quality, uint8 velo, uint8 status, uint64 committedAt, bytes32 commit, uint32 day, bytes32 drawHash)",
   "function settleNextDay(uint8 league)",
-  "event SwingCommitted(uint256 indexed swingId, address indexed player, uint8 league, uint8 quality, uint8 velo, uint64 targetBlock)",
+  "event SwingCommitted(uint256 indexed swingId, address indexed player, uint8 league, uint8 quality, uint8 velo, uint64 committedAt)",
+  "event SwingDrawn(uint256 indexed swingId, bytes32 drawHash)",
+  "event SwingRefunded(uint256 indexed swingId, address indexed player, uint8 league)",
   "event SwingResolved(uint256 indexed swingId, address indexed player, uint8 tier, uint16 feet)",
   "event DaySettled(uint8 indexed league, uint256 indexed day, address[] winners, uint256[] amounts, address settler, uint256 tip, uint256 rollover)",
   "event TurnsBought(address indexed player, uint8 indexed league, uint256 count, uint256 cost, uint256 burned)",
@@ -95,7 +104,13 @@ export const DERBY_ABI = [
   "error BadCommit()",
   "error BadSalt()",
   "error WrongStatus()",
-  "error TooEarly()",
+  "error DrawClosed()",
+  "error BadDraw()",
+  "error BadKey()",
+  "error CommitUsed()",
+  "error NoHouseKey()",
+  "error KeyNotReady()",
+  "error KeyExpired()",
   "error NotExpired()",
   "error BadSession()",
   "error TransferFailed()",
@@ -105,6 +120,23 @@ export const DERBY_ABI = [
   "error NotAContract()",
   "error ZeroCount()",
 ];
+
+/** Decode only events emitted by the configured game contract. */
+export function parseDerbyEvent(
+  logs: readonly { address: string; topics: readonly string[]; data: string }[],
+  name: string,
+  contract: string,
+  iface = new Interface(DERBY_ABI),
+) {
+  for (const log of logs) {
+    if (log.address.toLowerCase() !== contract.toLowerCase()) continue;
+    try {
+      const ev = iface.parseLog(log);
+      if (ev?.name === name) return ev;
+    } catch { /* unrelated event */ }
+  }
+  return null;
+}
 
 const ERC20_ABI = [
   "function balanceOf(address) view returns (uint256)",
@@ -121,9 +153,15 @@ const CUSTOM_ERRORS: Record<string, string> = {
   BadQuality: "Quality and velo must be between 0 and 100.",
   BadCommit: "The swing commit was empty.",
   BadSalt: "The revealed salt does not match the commit.",
-  WrongStatus: "That swing is not waiting for a reveal (already resolved or never committed).",
-  TooEarly: "The target block has not been mined yet; the swing cannot be revealed so soon.",
-  NotExpired: "That swing can still be revealed, so it cannot be expired yet.",
+  WrongStatus: "That swing is not in the required state for this action.",
+  DrawClosed: "The house draw window has closed.",
+  BadDraw: "The house draw signature is invalid.",
+  BadKey: "The house key is invalid.",
+  CommitUsed: "That swing commit has already been used; use a fresh salt.",
+  NoHouseKey: "The house draw is paused (no house key). Nothing was spent; try again later.",
+  KeyNotReady: "The proposed house key is not ready to activate yet.",
+  KeyExpired: "The proposed house key has expired.",
+  NotExpired: "That swing is still within its draw or reveal window, so it cannot be expired yet.",
   BadSession: "The session key is not valid for this player.",
   TransferFailed: "An IMD or ETH transfer failed.",
   NothingToSettle: "There is no unsettled day waiting in this league.",
@@ -176,7 +214,7 @@ export interface ChainOptions {
 export function createChain(opts: ChainOptions): DerbyChain {
   // No read cache: on ~100ms blocks the default cache can return a stale nonce after a tx.
   const provider = new JsonRpcProvider(opts.rpcUrl, Network.from(4663), { cacheTimeout: -1, staticNetwork: true });
-  provider.pollingInterval = 200;
+  provider.pollingInterval = 1000;
   let signer: Wallet | undefined;
   if (opts.privateKey) {
     try {
@@ -199,17 +237,26 @@ export function createChain(opts: ChainOptions): DerbyChain {
       return await p();
     } catch (err) {
       const e = new Error(explainError(err, derby.interface)) as Error & {
-        confirmedNoCharge?: boolean;
+        reportedRevert?: boolean;
         transactionHash?: string;
       };
-      const source = err as { confirmedNoCharge?: boolean; transactionHash?: string };
-      e.confirmedNoCharge = source.confirmedNoCharge;
+      const source = err as { reportedRevert?: boolean; transactionHash?: string };
+      e.reportedRevert = source.reportedRevert;
       e.transactionHash = source.transactionHash;
       throw e;
     }
   };
   const send = async (txPromise: Promise<any>) => {
-    const tx = await txPromise;
+    let tx: any;
+    try {
+      tx = await txPromise;
+    } catch (err) {
+      // Estimation/broadcast may also report a revert; the server still verifies state.
+      if ((err as { code?: string }).code === "CALL_EXCEPTION") {
+        (err as { reportedRevert?: boolean }).reportedRevert = true;
+      }
+      throw err;
+    }
     let rc: any;
     try {
       rc = await tx.wait(1, opts.txTimeoutMs ?? 60000);
@@ -217,7 +264,7 @@ export function createChain(opts: ChainOptions): DerbyChain {
       const source = err as { code?: string; receipt?: { status?: number } };
       if (source.code === "CALL_EXCEPTION" && source.receipt?.status === 0) {
         const e = new Error(`Transaction ${tx.hash} reverted.`);
-        (e as Error & { confirmedNoCharge?: boolean }).confirmedNoCharge = true;
+        (e as Error & { reportedRevert?: boolean }).reportedRevert = true;
         throw e;
       }
       const e = new Error(`${explainError(err)} (transaction ${tx.hash} was broadcast but not confirmed).`);
@@ -226,26 +273,21 @@ export function createChain(opts: ChainOptions): DerbyChain {
     }
     if (!rc || rc.status !== 1) {
       const e = new Error(`Transaction ${tx.hash} reverted.`);
-      (e as Error & { confirmedNoCharge?: boolean }).confirmedNoCharge = true;
+      (e as Error & { reportedRevert?: boolean }).reportedRevert = true;
       throw e;
     }
     return rc;
   };
   const event = (rc: any, name: string) => {
-    for (const log of rc.logs) {
-      try {
-        const ev = derby.interface.parseLog(log);
-        if (ev && ev.name === name) return ev;
-      } catch {
-        /* log from another contract */
-      }
-    }
+    const ev = parseDerbyEvent(rc.logs, name, opts.contract, derby.interface);
+    if (ev) return ev;
     throw new Error(`Transaction ${rc.hash} did not emit ${name}.`);
   };
 
   let lastBuyCost: bigint | undefined;
   return {
     wallet: signer?.address,
+    pollIntervalMs: 1000,
     get lastBuyCost() { return lastBuyCost; },
     currentDay: () => wrap(async () => BigInt(await derby.currentDay())),
     packPrice: () => wrap(async () => BigInt(await derby.packPrice())),
@@ -266,6 +308,11 @@ export function createChain(opts: ChainOptions): DerbyChain {
         return { exists: r[0], ready: r[1], day: BigInt(r[2]), amount: BigInt(r[3]), tip: BigInt(r[4]) };
       }),
     blockNumber: () => wrap(async () => Number(await provider.send("eth_blockNumber", []))),
+    blockTimestamp: () => wrap(async () => {
+      const block = await provider.getBlock("latest");
+      if (!block) throw new Error("The latest block is unavailable.");
+      return block.timestamp;
+    }),
     approve: (amount) =>
       wrap(async () => {
         const rc = await send((await imd()).approve(opts.contract, amount));
@@ -292,7 +339,13 @@ export function createChain(opts: ChainOptions): DerbyChain {
         const swingId = BigInt(committed.args.swingId);
         return {
           swingId,
-          targetBlock: Number(committed.args.targetBlock),
+          committedAt: Number(committed.args.committedAt),
+          status: () => wrap(async () => Number((await derby.swings(swingId)).status)),
+          expire: () => wrap(async () => {
+            const expired = await send(derby.expire(swingId));
+            event(expired, "SwingRefunded");
+            return expired.hash as string;
+          }),
           commitTxHash: rc.hash as string,
           reveal: () =>
             wrap(async () => {

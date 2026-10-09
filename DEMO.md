@@ -1,5 +1,7 @@
 # Live demo
 
+This run was recorded on the first SwarmDerby (`0xBa58BC6b5aCf8043DAEa2Bf1BF6C1c09cF84b03C`), before the move to SwarmDerby v2.
+
 A recorded session on Robinhood Chain mainnet, 2026-10-07 19:41:16 to 19:41:36 UTC. An MCP SDK client over stdio made the calls of scripts/demo.mjs against dist/index.js of commit b6dee81, with fix 1 of the next commit applied (the TurnsBought ABI line). Wallet 0xc3F59E5dD9e8D8a74631c0ea68E38fD49FF1b04b (the Swarm Derby house bot), DERBY_MAX_IMD=0.5, a new ledger.
 
 | # | Call | Result |

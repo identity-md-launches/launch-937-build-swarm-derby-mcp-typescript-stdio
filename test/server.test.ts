@@ -1,11 +1,14 @@
 import { strict as assert } from "node:assert";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { describe, it } from "node:test";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { parseEther } from "ethers";
 import type { Board, DerbyChain, League, PendingSwing, Settlement } from "../src/chain.js";
 import type { Config } from "../src/config.js";
-import { MemoryLedger } from "../src/ledger.js";
+import { MemoryLedger, FileLedger, type Ledger } from "../src/ledger.js";
 import { createServer } from "../src/server.js";
 
 const WALLET = "0x1111111111111111111111111111111111111111";
@@ -24,7 +27,8 @@ class FakeChain implements DerbyChain {
   board_: Board = { players: [OTHER, WALLET], scores: [900n, 400n] };
   settlement: Settlement = { exists: true, ready: true, day: 19999n, amount: E("3"), tip: E("0.01") };
   block = 100;
-  blocksPerPoll = 3;
+  timestamp = 1000;
+  pendingStatus = 1;
   stuck = false;
   swingTier = 4;
   revealFails = false;
@@ -41,7 +45,8 @@ class FakeChain implements DerbyChain {
   async board(_l: League, day: bigint) { return day === this.day ? this.board_ : { players: [], scores: [] }; }
   async dayPot() { return E("2"); }
   async nextSettlement() { return this.settlement; }
-  async blockNumber() { if (!this.stuck) this.block += this.blocksPerPoll; return this.block; }
+  async blockNumber() { return this.block; }
+  async blockTimestamp() { return this.timestamp; }
   async approve(amount: bigint) { this.calls.push("approve"); this.approvals.push(amount); this.allow = amount; return "0xapprove"; }
   async buyPacks(_l: League, packs: number) {
     this.calls.push("buyPacks");
@@ -52,13 +57,22 @@ class FakeChain implements DerbyChain {
   async commitSwing(): Promise<PendingSwing> {
     this.calls.push("swing");
     this.turnCount -= 1n;
+    this.pendingStatus = 1;
     return {
       swingId: 42n,
-      targetBlock: this.block + 5,
+      committedAt: this.timestamp,
+      status: async () => this.pendingStatus === 1 && !this.stuck ? 2 : this.pendingStatus,
+      expire: async () => {
+        this.calls.push("expire");
+        this.pendingStatus = 4;
+        this.turnCount += 1n;
+        return "0xexpire";
+      },
       commitTxHash: "0xcommit",
       reveal: async () => {
         this.calls.push("finalize");
-        if (this.revealFails) throw new Error("The target block has not been mined yet.");
+        if (this.revealFails) throw new Error("The reveal failed.");
+        this.pendingStatus = 3;
         if (this.swingTier >= 3) this.score += 450n;
         return { txHash: "0xfinal", tier: this.swingTier, feet: this.swingTier >= 3 ? 450 : 0 };
       },
@@ -70,9 +84,9 @@ class FakeChain implements DerbyChain {
   }
 }
 
-const CONFIG: Config = { maxImdWei: E("2"), revealTimeoutMs: 200, pollIntervalMs: 1 };
+const CONFIG: Config = { maxImdWei: E("2"), drawTimeoutMs: 200, pollIntervalMs: 1 };
 
-async function connect(chain = new FakeChain(), ledger = new MemoryLedger(), config = CONFIG) {
+async function connect(chain = new FakeChain(), ledger: Ledger = new MemoryLedger(), config = CONFIG) {
   const client = new Client({ name: "test-client", version: "0.0.0" });
   const [ct, st] = InMemoryTransport.createLinkedPair();
   await Promise.all([createServer({ chain, ledger, config }).connect(st), client.connect(ct)]);
@@ -166,12 +180,13 @@ describe("derby_buy_pack", () => {
     assert.equal(r.structuredContent.cap.remainingImd, "1.0");
   });
 
-  it("skips the approval when the allowance already covers the cost", async () => {
+  it("replaces a large existing allowance with the exact quoted cost", async () => {
     const chain = new FakeChain();
-    chain.allow = E("100");
+    chain.allow = E("10");
     const r: any = await (await connect(chain)).call("derby_buy_pack", { packs: 1 });
     assert.equal(r.isError, undefined);
-    assert.deepEqual(chain.calls, ["buyPacks"]);
+    assert.deepEqual(chain.calls, ["approve", "buyPacks"]);
+    assert.deepEqual(chain.approvals, [PRICE]);
   });
 
   it("releases the cap reservation when buyPacks confirms a revert", async () => {
@@ -231,7 +246,7 @@ describe("derby_buy_pack", () => {
 });
 
 describe("derby_swing", () => {
-  it("commits, waits for the target block, reveals and reports", async () => {
+  it("commits, waits for the house draw, reveals and reports", async () => {
     const chain = new FakeChain();
     chain.turnCount = 5n;
     const r: any = await (await connect(chain)).call("derby_swing", {});
@@ -267,10 +282,10 @@ describe("derby_swing", () => {
     assert.deepEqual(none.calls, []);
   });
 
-  it("times out waiting for the target block and names the swing", async () => {
+  it("times out waiting for the house draw and names the swing", async () => {
     const chain = new FakeChain();
     chain.turnCount = 1n; chain.stuck = true;
-    const r: any = await (await connect(chain, new MemoryLedger(), { ...CONFIG, revealTimeoutMs: 30 })).call("derby_swing", {});
+    const r: any = await (await connect(chain, new MemoryLedger(), { ...CONFIG, drawTimeoutMs: 30 })).call("derby_swing", {});
     assert.equal(r.isError, true);
     assert.match(text(r), /Swing 42/);
     assert.deepEqual(chain.calls, ["swing"]);
@@ -328,4 +343,164 @@ describe("derby_settle", () => {
     const r: any = await (await connect(chain)).call("derby_settle", {});
     assert.equal(r.isError, true);
   });
+});
+
+describe("v2 recovery and review regressions", () => {
+  it("reveals a kept swing drawn between calls, even with no turns left", async () => {
+    const chain = new FakeChain(); chain.turnCount = 1n; chain.stuck = true;
+    const { call } = await connect(chain, new MemoryLedger(), { ...CONFIG, drawTimeoutMs: 10 });
+    assert.equal((await call("derby_swing") as any).isError, true);
+    chain.pendingStatus = 2;
+    const r: any = await call("derby_swing");
+    assert.equal(r.isError, undefined);
+    assert.equal(r.structuredContent.earlier[0].swingId, "42");
+    assert.equal(r.structuredContent.earlier[0].todayScore, 450);
+    assert.deepEqual(chain.calls, ["swing", "finalize"]);
+  });
+
+  it("expires a kept swing only past 300 chain seconds and reports the returned turn and tx", async () => {
+    const chain = new FakeChain(); chain.turnCount = 1n; chain.stuck = true;
+    const { call } = await connect(chain, new MemoryLedger(), { ...CONFIG, drawTimeoutMs: 10 });
+    await call("derby_swing");
+    chain.timestamp = 1300;
+    await call("derby_swing");
+    assert.deepEqual(chain.calls, ["swing"]);
+    chain.timestamp = 1301;
+    // Refuse the next swing so the refunded turn stays visible.
+    chain.eth = 0n;
+    const r: any = await call("derby_swing");
+    assert.match(text(r), /The house did not draw swing 42 within 5 minutes. The turn was given back \(tx 0xexpire\)/);
+    assert.equal(chain.turnCount, 1n);
+    assert.deepEqual(chain.calls, ["swing", "expire"]);
+  });
+
+  it("reports a late reveal as a foul", async () => {
+    const chain = new FakeChain(); chain.turnCount = 1n; chain.stuck = true;
+    const { call } = await connect(chain, new MemoryLedger(), { ...CONFIG, drawTimeoutMs: 10 });
+    await call("derby_swing");
+    chain.timestamp = 1601; chain.pendingStatus = 2; chain.swingTier = 1;
+    const r: any = await call("derby_swing");
+    assert.equal(r.structuredContent.tierName, "FOUL");
+    assert.match(r.structuredContent.earlier[0].note, /counted as a foul/);
+  });
+
+  it("reports NoHouseKey without spending IMD", async () => {
+    const chain = new FakeChain();
+    const sentence = "The house draw is paused (no house key). Nothing was spent; try again later.";
+    chain.buyPacks = async () => { throw Object.assign(new Error(sentence), { reportedRevert: true }); };
+    const ledger = new MemoryLedger();
+    const r: any = await (await connect(chain, ledger)).call("derby_buy_pack", { packs: 1 });
+    assert.equal(text(r), sentence);
+    assert.equal(ledger.spent(WALLET), 0n);
+    chain.turnCount = 1n;
+    chain.commitSwing = async () => { throw new Error(sentence); };
+    assert.equal(text(await (await connect(chain)).call("derby_swing")), sentence);
+  });
+
+  it("a raised price cannot use the old 10 IMD allowance", async () => {
+    const chain = new FakeChain(); chain.allow = E("10");
+    chain.buyPacks = async () => {
+      assert.equal(chain.allow, PRICE);
+      const raisedPrice = E("1");
+      assert.ok(chain.allow < raisedPrice);
+      throw Object.assign(new Error("Transfer failed: raised price exceeds allowance."), { reportedRevert: true });
+    };
+    const ledger = new MemoryLedger();
+    const r: any = await (await connect(chain, ledger)).call("derby_buy_pack", { packs: 1 });
+    assert.equal(r.isError, true);
+    assert.deepEqual(chain.approvals, [PRICE]);
+    assert.equal(chain.imd, E("10"));
+    assert.equal(ledger.spent(WALLET), 0n);
+  });
+
+  it("keeps and reports a receipt cost above the quote, including a ledger without adjust", async () => {
+    for (const minimal of [false, true]) {
+      const chain = new FakeChain(); chain.allow = E("10");
+      chain.buyPacks = async () => {
+        chain.imd -= E("1"); chain.turnCount += 5n;
+        return { txHash: "0xbuy", costWei: E("1") } as any;
+      };
+      const memory = new MemoryLedger();
+      const ledger: Ledger = minimal
+        ? { spent: memory.spent.bind(memory), add: memory.add.bind(memory) }
+        : memory;
+      const r: any = await (await connect(chain, ledger)).call("derby_buy_pack", { packs: 1 });
+      assert.equal(r.isError, true);
+      assert.match(text(r), /above the quoted price/);
+      assert.deepEqual(chain.approvals, [PRICE]);
+      assert.equal(ledger.spent(WALLET), E("1"));
+    }
+  });
+
+  it("keeps a reservation when a reported revert actually grew turns", async () => {
+    const chain = new FakeChain();
+    chain.buyPacks = async () => {
+      chain.turnCount += 5n;
+      throw Object.assign(new Error("Transaction 0xbuy reverted."), { reportedRevert: true });
+    };
+    const ledger = new MemoryLedger();
+    const { call } = await connect(chain, ledger, { ...CONFIG, maxImdWei: PRICE });
+    assert.equal((await call("derby_buy_pack", { packs: 1 }) as any).isError, true);
+    assert.equal(ledger.spent(WALLET), PRICE);
+    assert.equal((await call("derby_buy_pack", { packs: 1 }) as any).isError, true);
+    assert.deepEqual(chain.approvals, [PRICE]);
+  });
+
+  it("keeps a reservation if balance fell or the second reads fail", async () => {
+    for (const readFailure of [false, true]) {
+      const chain = new FakeChain();
+      chain.buyPacks = async () => {
+        if (readFailure) chain.imdBalance = async () => { throw new Error("RPC unavailable"); };
+        else chain.imd -= PRICE;
+        throw Object.assign(new Error("Reported revert"), { reportedRevert: true });
+      };
+      const ledger = new MemoryLedger();
+      await (await connect(chain, ledger)).call("derby_buy_pack", { packs: 1 });
+      assert.equal(ledger.spent(WALLET), PRICE);
+    }
+  });
+
+  it("no buy is signed for malformed ledger contents", async () => {
+    for (const spent of [[], { [WALLET]: "-100" }, { [WALLET]: "1e18" }, { nope: "100" }]) {
+      const path = join(mkdtempSync(join(tmpdir(), "ledger-buy-")), "ledger.json");
+      writeFileSync(path, JSON.stringify({ spent }));
+      const chain = new FakeChain();
+      const r: any = await (await connect(chain, new FileLedger(path))).call("derby_buy_pack", { packs: 1 });
+      assert.equal(r.isError, true);
+      assert.match(text(r), /unreadable; fix or remove it by hand/);
+      assert.deepEqual(chain.calls, []);
+    }
+  });
+});
+
+it("does not finalize until the house status becomes drawn", async () => {
+  const chain = new FakeChain(); chain.turnCount = 1n;
+  const commit = chain.commitSwing.bind(chain);
+  let reads = 0;
+  chain.commitSwing = async () => {
+    const pending = await commit();
+    pending.status = async () => {
+      reads++;
+      if (reads < 3) assert.deepEqual(chain.calls, ["swing"]);
+      return reads < 3 ? 1 : 2;
+    };
+    return pending;
+  };
+  const r: any = await (await connect(chain)).call("derby_swing");
+  assert.equal(r.isError, undefined);
+  assert.equal(reads, 3);
+  assert.equal(r.structuredContent.todayScore, 450);
+});
+
+it("drops kept swings that are already final or refunded", async () => {
+  for (const status of [3, 4]) {
+    const chain = new FakeChain(); chain.turnCount = 1n; chain.stuck = true;
+    const { call } = await connect(chain, new MemoryLedger(), { ...CONFIG, drawTimeoutMs: 10 });
+    await call("derby_swing");
+    chain.pendingStatus = status;
+    await call("derby_swing");
+    chain.pendingStatus = 2;
+    await call("derby_swing");
+    assert.deepEqual(chain.calls, ["swing"]);
+  }
 });
